@@ -1,5 +1,6 @@
 /**
  * Pulse counting using 3 GPIOs with BLE advertisments every 30 seconds.
+ * HA BLE format is used for Bluetooth advertisements.
  *
  * We don't use the Pulse Counter peripherals as they run on the APB clock at 80MHz
  * and only have a 10-bit filter for short pulses; 1023 cycles - still less than 1ms.
@@ -12,9 +13,7 @@
  * FILTER_MS ms.
  */
 
-#include "BLEDevice.h"
-#include "BLEUtils.h"
-#include "BLEBeacon.h"
+#include "NimBLEDevice.h"
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled!
@@ -58,6 +57,11 @@ void printCounters()
   Serial.println(out);
 }
 
+void ledOff(NimBLEAdvertising* unused)
+{
+  digitalWrite(GPIO_LED_BUILTIN, LOW);
+}
+
 // Send a BLE advertisement
 void bleAdvertise()
 {
@@ -67,13 +71,7 @@ void bleAdvertise()
   // Update data as needed and briefly advertise
   updateAdvertData();
   advertCount++;
-  pAdvertising->start();
-  delay(1000);
-  // FIXME: Advertising seems not to stop when requested!!
-  pAdvertising->stop();
-
-  // LED off
-  digitalWrite(GPIO_LED_BUILTIN, LOW);
+  pAdvertising->start(3, &ledOff); // Advertise for 3 seconds and turn off LED when advertising complete (callback)
 }
 
 // Button GPIO interrupt service routine
@@ -127,6 +125,13 @@ void setup()
 
   // BLE init
   BLEDevice::init("");
+
+  const uint8_t* macAddress = BLEDevice::getAddress().getNative();
+  Serial.printf("MAC address is: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                macAddress[0], macAddress[1], macAddress[2],
+                macAddress[3], macAddress[4], macAddress[5]
+               );
+
   pAdvertising = BLEDevice::getAdvertising();
   setupInitialAdvertAndScanData();
 }
@@ -137,17 +142,17 @@ struct AdvertData
 /* uint8_t length;
   uint8_t uuidLengthInBits; // 16 for us
   uint16_t uuid;*/
-  uint8_t macAddress[6];  // Why do we need the MAC address in the data both forwards and backwards?  Remove?
-  uint8_t framePacketCounter;
-  uint8_t counterMarker0;
+  uint16_t packetIDMarker;
+  uint8_t packetID;
+  uint16_t counterMarker0;
   uint32_t counter0;
-  uint8_t counterMarker1;
+  uint16_t counterMarker1;
   uint32_t counter1;
-  uint8_t counterMarker2;
+  uint16_t counterMarker2;
   uint32_t counter2;
 } __attribute__((packed));
 
-#define HOMEBREW_UUID         ((uint16_t)0x191a)
+#define HA_BLE_UNENCRYPTED_UUID  ((uint16_t)0x181c)
 
 /**
  * Update the counter values in the advertising data
@@ -155,19 +160,19 @@ struct AdvertData
 void updateAdvertData()
 {
   static AdvertData* advertData = initialAdvertData();
-  static BLEUUID homebrewCounterUUID = BLEUUID(HOMEBREW_UUID);
+  static BLEUUID haBLEUnencryptedUUID = BLEUUID(HA_BLE_UNENCRYPTED_UUID);
   advertData->counter0 = (edgeCounter[0] >> 1);
   advertData->counter1 = (edgeCounter[1] >> 1);
   advertData->counter2 = (edgeCounter[2] >> 1);
-  advertData->framePacketCounter = advertCount;
+  advertData->packetID = advertCount;
 
   std::string advertDataStr = std::string((char*)advertData, sizeof(struct AdvertData));
 
   oAdvertisementData = BLEAdvertisementData();
-  //oAdvertisementData.setFlags(0x04); // BR_EDR_NOT_SUPPORTED 0x04
+  oAdvertisementData.setFlags(0x06); // LE_GENERAL_DISCOVERABLE_MODE 0x02 || BR_EDR_NOT_SUPPORTED 0x04
 
   Serial.println("Adding service data...");
-  oAdvertisementData.setServiceData(homebrewCounterUUID, advertDataStr);
+  oAdvertisementData.setServiceData(haBLEUnencryptedUUID, advertDataStr);
 
   std::string debug = oAdvertisementData.getPayload();
   Serial.printf("Advertising payload is %d bytes\n", debug.length());
@@ -197,47 +202,20 @@ void printStringAsHex(std::string s)
 
 struct AdvertData* initialAdvertData() {
   /*
-   *  From https://github.com/atc1441/ATC_MiThermometer/blob/master/README.md, modified for 3x counter values
+   * HA BLE advertising data format as described here:
+   *   https://custom-components.github.io/ble_monitor/ha_ble#diy-sensors-ha-ble
    *
-   *  Advertising format of the custom firmware:
-   *  The custom firmware sends advertising data on the UUID 0x191A with counter data.
-   *
-   *  The format of the advertising data is as follows:
-   *  Byte 0 Length
-   *  Byte 1 UUID length (bits)
-   *  Byte 2-3 UUID
-   *  Byte 4-9 MAC in correct order
-   *  Byte 10Frame packet counter
-   *  Byte 11 Counter data tag
-   *  Byte 12-15 Counter 1 value (int32)
-   *  Byte 16 Counter data tag
-   *  Byte 17-20 Counter 2 value (int32)
-   *  Byte 21 Counter data tag
-   *  Byte 22-25 Counter 3 value (int32)
-   *  Example: 0x0e,
-   *           0x16,
-   *           0x1a, 0x18,
-   *           0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-   *           0xee
-   *           0x01,
-   *           0xaa, 0xaa, 0xaa, 0xaa,
-   *           0x01,
-   *           0xbb, 0xbb, 0xbb, 0xbb,
-   *           0x01,
-   *           0xcc, 0xcc, 0xcc, 0xcc,
+   * Using 1x packedID and 3x 32-bit counters in the payload.
+   * The 'markers' are in fact a byte length and date type, hard-coded as numbers here for now.
    */
 
   // We start at the MAC address as setServiceData() will put in the length and UUID fields
   AdvertData* data = new AdvertData();
-  memcpy(data->macAddress, BLEDevice::getAddress().getNative(), 6);
-  Serial.printf("MAC address is: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                data->macAddress[0], data->macAddress[1], data->macAddress[2],
-                data->macAddress[3], data->macAddress[4], data->macAddress[5]
-               );
-  data->framePacketCounter = 0;
-  data->counterMarker0 = 0x1;
-  data->counterMarker1 = 0x1;
-  data->counterMarker2 = 0x1;
+  data->packetIDMarker = 0x0002;
+  data->packetID = 0;
+  data->counterMarker0 = 0x0905;
+  data->counterMarker1 = 0x0905;
+  data->counterMarker2 = 0x0905;
   data->counter0 = 0;
   data->counter1 = 0;
   data->counter2 = 0;
@@ -250,12 +228,12 @@ void setupInitialAdvertAndScanData()
   BLEAdvertisementData oScanResponseData = BLEAdvertisementData();
 
   oAdvertisementData = BLEAdvertisementData();
-  oAdvertisementData.setFlags(0x04); // BR_EDR_NOT_SUPPORTED 0x04
+  oAdvertisementData.setFlags(0x06); // BLE_HS_ADV_F_DISC_GEN || BLE_HS_ADV_F_BREDR_UNSUP
 
-  BLEUUID homebrewCounterUUID = BLEUUID(HOMEBREW_UUID);
+  BLEUUID haBLEUnencryptedUUID = BLEUUID(HA_BLE_UNENCRYPTED_UUID);
   std::string strServiceData = std::string((char*)initialAdvertData(), sizeof(AdvertData));
 
-  oAdvertisementData.setServiceData(homebrewCounterUUID, strServiceData);
+  oAdvertisementData.setServiceData(haBLEUnencryptedUUID, strServiceData);
 
   oAdvertisementData.setName("PulseCounter");
 
