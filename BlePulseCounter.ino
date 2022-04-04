@@ -17,31 +17,35 @@
 #include "BLEBeacon.h"
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#error Bluetooth is not enabled!
 #endif
 
 // So we can flash the blue LED from time to time
-#define LED_BUILTIN   2
+#define GPIO_LED_BUILTIN   2
 
 // Filter out edge detections if the previous were in this number of milliseconds
 // Photo-resistor pulses are to pick up very brief pulses from an LED on an electricity
 // meter, so our filter needs to be much shorter than for the movement of a magnet
-// past a reed switch as on gas/water meters.
+// passing a reed switch as on gas/water meters.
 #define FILTER_MS_REED  300
 #define FILTER_MS_PHOTO 25
 
 // Our bluetooth driver instantiation
 BLEAdvertising *pAdvertising;
 
-// 3 pulse counts initially 0
+// 3 pulse counts (initially 0)
 static volatile uint32_t edgeCounter[3] = {0, 0, 0};
 static volatile uint32_t lastMillis[3] = {0, 0, 0};
 // Set the filters for our 3 pulse counters
 static const uint32_t FILTER_MS[3] = {FILTER_MS_PHOTO, FILTER_MS_REED, FILTER_MS_REED};
+// Stores the counter value to put in adverts
 static unsigned int advertCount = 0;
+// Data for adverts
 static BLEAdvertisementData oAdvertisementData;
+// Request flag for printing of counter values
+static volatile bool reqPrintCounters = false;
 
-// Button press - serial output
+// Print counters via serial port (e.g. for debug, on button press)
 void printCounters()
 {
   String out = "";
@@ -58,7 +62,7 @@ void printCounters()
 void bleAdvertise()
 {
   // LED on
-  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(GPIO_LED_BUILTIN, HIGH);
 
   // Update data as needed and briefly advertise
   updateAdvertData();
@@ -69,14 +73,15 @@ void bleAdvertise()
   pAdvertising->stop();
 
   // LED off
-  digitalWrite(LED_BUILTIN, LOW);
+  digitalWrite(GPIO_LED_BUILTIN, LOW);
 }
 
 // Button GPIO interrupt service routine
 void IRAM_ATTR buttonISR()
 {
-  // Better for this not to be in an interrupt routine as it will hold up other interrupts!
-	//printCounters();
+  // Better for actual printing not to be in an interrupt routine as it would hold up other interrupts.
+  // Instead we flag that a print of the counters has been requested for the next loop iteration.
+  reqPrintCounters = true;
 }
 
 // Counter GPIO interrupt service routine
@@ -95,7 +100,7 @@ void IRAM_ATTR counterISR(void* arg)
 void setup()
 {
   // GPIO setup for blue LED
-  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(GPIO_LED_BUILTIN, OUTPUT);
 
   // Serial debug setup
   Serial.begin(115200);
@@ -108,7 +113,7 @@ void setup()
 
   // GPIO setup for Boot button
   pinMode(0, INPUT_PULLUP);
-  //attachInterrupt(0, buttonISR, RISING);
+  attachInterrupt(0, buttonISR, RISING);
 
   // GPIO setup for pulse edgeCounter inputs
   pinMode(34, INPUT);
@@ -262,16 +267,16 @@ void setupInitialAdvertAndScanData()
 
 void loop()
 {
-  // Handle Boot button presses
-  static uint8_t lastPinState = 1;
-  uint8_t pinState = digitalRead(0);
-  if(!pinState && lastPinState){
+  // Handle request to print counters
+  if (reqPrintCounters)
+  {
+    reqPrintCounters = false;
 	  printCounters();
   }
-  lastPinState = pinState;
-  // Advertise every 30 seconds - we should use a timer for this so the
-  // button state is polled more regularly or use an interrupt for the
-  // button.
+
+  // Advertise every 30 seconds - we should use a timer for this so there aren't such long
+  // delays between printing counters if there are requests to do so, but given that's just
+  // for debug it's not too important.
   bleAdvertise();
   delay(30 * 1000);
 }
